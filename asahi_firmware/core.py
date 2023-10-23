@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: MIT
-import tarfile, io, logging
+import tarfile, io, logging, os.path
 from hashlib import sha256
+from . import cpio
+
+UBOOT_FILES = set([
+    "asmedia/asm2214a-apple.bin"
+])
 
 class FWFile(object):
     def __init__(self, name, data):
@@ -20,14 +25,37 @@ class FWFile(object):
         return hash(self.sha)
 
 class FWPackage(object):
-    def __init__(self, target):
-        self.path = target
-        self.tarfile = tarfile.open(target, mode="w")
+    def __init__(self, path):
+        self.closed = False
+        self.path = path
+        self.tar_path = os.path.join(path, "firmware.tar")
+        self.cpio_path = os.path.join(path, "firmware.cpio")
+        self.tarfile = tarfile.open(self.tar_path, mode="w")
+        self.cpiofile = cpio.CPIO(self.cpio_path)
         self.hashes = {}
         self.manifest = []
 
     def close(self):
+        if self.closed:
+            return
+
+        self.closed = True
+
+        ti = tarfile.TarInfo("vendorfw/.vendorfw.manifest")
+        ti.type = tarfile.REGTYPE
+        fd = io.BytesIO()
+        for i in self.manifest:
+            fd.write(i.encode("ascii") + b"\n")
+        ti.size = fd.tell()
+        fd.seek(0)
+        self.cpiofile.addfile(ti, fd)
+
         self.tarfile.close()
+        self.cpiofile.close()
+
+        with open(os.path.join(self.path, "manifest.txt"), "w") as fd:
+            for i in self.manifest:
+                fd.write(i + "\n")
 
     def add_file(self, name, data):
         ti = tarfile.TarInfo(name)
@@ -45,15 +73,22 @@ class FWPackage(object):
 
         logging.info(f"+ {self.manifest[-1]}")
         self.tarfile.addfile(ti, fd)
+        if fd is not None:
+            fd.seek(0)
+        ti.name = os.path.join("vendorfw", ti.name)
+        if ti.linkname:
+            ti.linkname = os.path.join("vendorfw", ti.linkname)
+        self.cpiofile.addfile(ti, fd)
+
+        if name in UBOOT_FILES:
+            path = os.path.join(self.path, "u-boot", name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fd:
+                fd.write(data.data)
 
     def add_files(self, it):
         for name, data in it:
             self.add_file(name, data)
 
-    def save_manifest(self, filename):
-        with open(filename, "w") as fd:
-            for i in self.manifest:
-                fd.write(i + "\n")
-
     def __del__(self):
-        self.tarfile.close()
+        self.close()

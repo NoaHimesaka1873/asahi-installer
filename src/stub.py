@@ -4,18 +4,23 @@ import osenum
 from asahi_firmware.wifi import WiFiFWCollection
 from asahi_firmware.bluetooth import BluetoothFWCollection
 from asahi_firmware.multitouch import MultitouchFWCollection
+from asahi_firmware.kernel import KernelFWCollection
+from asahi_firmware.isp import ISPFWCollection
 from util import *
 
 class StubInstaller(PackageInstaller):
-    def __init__(self, sysinfo, dutil, osinfo, ipsw_info):
+    def __init__(self, sysinfo, dutil, osinfo):
         super().__init__()
         self.dutil = dutil
         self.sysinfo = sysinfo
         self.osinfo = osinfo
-        self.install_version = ipsw_info.version.split(maxsplit=1)[0]
         self.ucache = None
         self.copy_idata = []
         self.stub_info = {}
+        self.pkg = None
+
+    def load_ipsw(self, ipsw_info):
+        self.install_version = ipsw_info.version.split(maxsplit=1)[0]
 
         base = os.environ.get("IPSW_BASE", None)
         url = ipsw_info.url
@@ -101,6 +106,46 @@ class StubInstaller(PackageInstaller):
         logging.info(f"chflags {flags} {path}")
         subprocess.run(["chflags", flags, path], check=True)
 
+    def get_paths(self):
+        self.resources = os.path.join(self.osi.system, "Finish Installation.app/Contents/Resources")
+        self.step2_sh = os.path.join(self.resources, "step2.sh")
+        self.boot_obj_path = os.path.join(self.resources, "boot.bin")
+        self.iapm_path = os.path.join(self.osi.system, ".IAPhysicalMedia")
+        self.iapm_dis_path = os.path.join(self.osi.system, "IAPhysicalMedia-disabled.plist")
+        self.core_services = os.path.join(self.osi.system, "System/Library/CoreServices")
+        self.sv_path = os.path.join(self.core_services, "SystemVersion.plist")
+        self.sv_dis_path = os.path.join(self.core_services, "SystemVersion-disabled.plist")
+        self.icon_path = os.path.join(self.osi.system, ".VolumeIcon.icns")
+
+    def check_existing_install(self, osi):
+        self.osi = osi
+        self.get_paths()
+
+        if not os.path.exists(self.step2_sh):
+            logging.error("step2.sh is missing")
+            return False
+        if not os.path.exists(self.boot_obj_path):
+            logging.error("boot.bin is missing")
+            return False
+        if not any(os.path.exists(i) for i in (self.iapm_path, self.iapm_dis_path)):
+            logging.error(".IAPhysicalMedia is missing")
+            return False
+        if not any(os.path.exists(i) for i in (self.sv_path, self.sv_dis_path)):
+            logging.error("SystemVersion is missing")
+            return False
+
+        return True
+
+    def prepare_for_bless(self):
+        if not os.path.exists(self.sv_path):
+            os.replace(self.sv_dis_path, self.sv_path)
+
+    def prepare_for_step2(self):
+        if os.path.exists(self.sv_path):
+            os.replace(self.sv_path, self.sv_dis_path)
+        if not os.path.exists(self.iapm_path):
+            os.replace(self.iapm_dis_path, self.iapm_path)
+
     def install_files(self, cur_os):
         logging.info("StubInstaller.install_files()")
         logging.info(f"VGID: {self.osi.vgid}")
@@ -108,6 +153,8 @@ class StubInstaller(PackageInstaller):
 
         p_progress("Beginning stub OS install...")
         ipsw = self.pkg
+
+        self.get_paths()
 
         logging.info("Parsing metadata...")
 
@@ -131,6 +178,7 @@ class StubInstaller(PackageInstaller):
         logging.info(f'Using OS build {identity["Info"]["BuildNumber"]} for {self.sysinfo.device_class}')
 
         self.all_identities = manifest["BuildIdentities"]
+        self.identity = identity
         manifest["BuildIdentities"] = [identity]
 
         self.stub_info.update({
@@ -149,7 +197,7 @@ class StubInstaller(PackageInstaller):
         logging.info("Setting up System volume")
 
         self.extract("usr/standalone/bootcaches.plist", self.osi.system)
-        shutil.copy("logo.icns", os.path.join(self.osi.system, ".VolumeIcon.icns"))
+        shutil.copy("logo.icns", self.icon_path)
 
         cs = os.path.join(self.osi.system, "System/Library/CoreServices")
         os.makedirs(cs, exist_ok=True)
@@ -199,8 +247,11 @@ class StubInstaller(PackageInstaller):
         self.extract_tree("Firmware/Manifests/restore/macOS Customer/", restore_bundle)
 
         copied = set()
+        self.kernel_path = None
         for key, val in identity["Manifest"].items():
             if key in ("BaseSystem", "OS", "Ap,SystemVolumeCanonicalMetadata"):
+                continue
+            if key.startswith("Cryptex"):
                 continue
             path = val["Info"]["Path"]
             if path in copied:
@@ -209,6 +260,8 @@ class StubInstaller(PackageInstaller):
             if path.startswith("kernelcache."):
                 name = os.path.basename(path)
                 self.copy_idata.append((os.path.join(restore_bundle, name), name))
+                if self.kernel_path is None:
+                    self.kernel_path = os.path.join(restore_bundle, name)
             copied.add(path)
 
         self.flush_progress()
@@ -250,36 +303,37 @@ class StubInstaller(PackageInstaller):
         os.makedirs(basesystem_path, exist_ok=True)
 
         logging.info("Extracting arm64eBaseSystem.dmg")
-        self.extract_file(identity["Manifest"]["BaseSystem"]["Info"]["Path"],
+        self.copy_compress(identity["Manifest"]["BaseSystem"]["Info"]["Path"],
                           os.path.join(basesystem_path, "arm64eBaseSystem.dmg"))
         self.flush_progress()
-
-        self.systemversion_path = os.path.join(cs, "SystemVersion.plist")
 
         p_progress("Wrapping up...")
 
         logging.info("Writing SystemVersion.plist")
-        with open(self.systemversion_path, "wb") as fd:
+        with open(self.sv_path, "wb") as fd:
             plistlib.dump(sysver, fd)
-        self.copy_idata.append((self.systemversion_path, "SystemVersion.plist"))
+        self.copy_idata.append((self.sv_path, "SystemVersion.plist"))
+
+        if os.path.exists(self.sv_dis_path):
+            os.remove(self.sv_dis_path)
 
         logging.info("Copying Finish Installation.app")
         shutil.copytree("step2/Finish Installation.app",
                         os.path.join(self.osi.system, "Finish Installation.app"))
 
         logging.info("Writing step2.sh")
-        step2_sh = open("step2/step2.sh").read().replace("##VGID##", self.osi.vgid)
-        resources = os.path.join(self.osi.system, "Finish Installation.app/Contents/Resources")
-        step2_sh_dst = os.path.join(resources, "step2.sh")
-        with open(step2_sh_dst, "w") as fd:
+        step2_sh = open("step2/step2.sh").read()
+        step2_sh = step2_sh.replace("##VGID##", self.osi.vgid)
+        step2_sh = step2_sh.replace("##PREBOOT##", self.osi.preboot_vgid)
+        with open(self.step2_sh, "w") as fd:
             fd.write(step2_sh)
-        os.chmod(step2_sh_dst, 0o755)
-        self.step2_sh = step2_sh_dst
-        self.boot_obj_path = os.path.join(resources, "boot.bin")
+        os.chmod(self.step2_sh, 0o755)
 
         logging.info("Copying .IAPhysicalMedia")
-        shutil.copy("step2/IAPhysicalMedia.plist",
-                    os.path.join(self.osi.system, ".IAPhysicalMedia"))
+        shutil.copy("step2/IAPhysicalMedia.plist", self.iapm_path)
+
+        if os.path.exists(self.iapm_dis_path):
+            os.remove(self.iapm_dis_path)
 
         print()
         p_success("Stub OS installation complete.")
@@ -291,15 +345,19 @@ class StubInstaller(PackageInstaller):
         logging.info("StubInstaller.collect_firmware()")
 
         logging.info("Collecting FUD firmware")
+        if os.path.exists("fud_firmware"):
+            shutil.rmtree("fud_firmware")
+
         os.makedirs("fud_firmware", exist_ok=True)
         copied = set()
-        for identity in self.all_identities:
+        for identity in [self.identity]:
             if (identity["Info"]["RestoreBehavior"] != "Erase" or
                 identity["Info"]["Variant"] != "macOS Customer"):
                 continue
             device = identity["Info"]["DeviceClass"]
             if not device.endswith("ap"):
                 continue
+            logging.info(f"Collecting FUD firmware for device {device}")
             device = device[:-2]
             for key, val in identity["Manifest"].items():
                 if key in ("BaseSystem", "OS", "Ap,SystemVolumeCanonicalMetadata",
@@ -333,10 +391,17 @@ class StubInstaller(PackageInstaller):
         logging.info("Collecting Multitouch firmware")
         col = MultitouchFWCollection("fud_firmware/")
         pkg.add_files(sorted(col.files()))
+        logging.info("Collecting ISP firmware")
+        col = ISPFWCollection("recovery/usr/sbin/")
+        pkg.add_files(sorted(col.files()))
+        logging.info("Collecting Kernel firmware")
+        col = KernelFWCollection(self.kernel_path)
+        pkg.add_files(sorted(col.files()))
         logging.info("Making fallback firmware archive")
         subprocess.run(["tar", "czf", "all_firmware.tar.gz",
                         "fud_firmware",
                         "-C", "recovery/usr/share", "firmware",
+                        "-C", "../../usr/sbin", "appleh13camerad",
                        ], check=True)
         self.copy_idata.append(("all_firmware.tar.gz", "all_firmware.tar.gz"))
         logging.info("Detaching recovery ramdisk")

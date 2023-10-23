@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 import os, shutil, sys, stat, subprocess, urlcache, zipfile, logging
 
+import m1n1
 from util import *
 
 class OSInstaller(PackageInstaller):
@@ -14,6 +15,7 @@ class OSInstaller(PackageInstaller):
         self.ucache = None
         self.efi_part = None
         self.idata_targets = []
+        self.install_size = self.min_size
 
     @property
     def default_os_name(self):
@@ -36,7 +38,8 @@ class OSInstaller(PackageInstaller):
         if not package:
             return
 
-        package = os.environ.get("REPO_BASE", ".") + "/os/" + package
+        if not package.startswith("http"):
+            package = os.environ.get("REPO_BASE", ".") + "/os/" + package
 
         logging.info(f"OS package URL: {package}")
         if package.startswith("http"):
@@ -61,6 +64,7 @@ class OSInstaller(PackageInstaller):
             expand_size = 0
         else:
             expand_size = total_size - self.min_size
+            self.install_size = total_size
             assert expand_size >= 0
 
         for part in self.template["partitions"]:
@@ -94,9 +98,35 @@ class OSInstaller(PackageInstaller):
 
             prev = info.name
 
-    def install(self, boot_obj_path):
+    def download_extras(self):
+        p_progress("Downloading extra files...")
+        logging.info("OSInstaller.download_extras()")
+
+        mountpoint = self.dutil.mount(self.efi_part.name)
+        dest = os.path.join(mountpoint, "asahi", "extras")
+        os.makedirs(dest, exist_ok=True)
+
+        count = len(self.template["extras"])
+        for i, url in enumerate(self.template["extras"]):
+            base = os.path.basename(url)
+            p_plain(f"  Downloading {base} ({i + 1}/{count})...")
+            ucache = urlcache.URLCache(url)
+            data = ucache.read()
+            with open(os.path.join(dest, base), "wb") as fd:
+                fd.write(data)
+
+    def install(self, stub_ins):
         p_progress("Installing OS...")
         logging.info("OSInstaller.install()")
+
+        # Force a reconnect, since the connection is likely to have timed out
+        if self.ucache is not None:
+            self.ucache.close_connection()
+
+        icon = self.template.get("icon", None)
+        if icon:
+            self.extract_file(icon, stub_ins.icon_path)
+            self.flush_progress()
 
         for part, info in zip(self.template["partitions"], self.part_info):
             logging.info(f"Installing partition {part!r} -> {info.name}")
@@ -121,14 +151,16 @@ class OSInstaller(PackageInstaller):
                 p_plain(f"  Copying firmware into {info.name} partition...")
                 base = os.path.join(mountpoint, "vendorfw")
                 logging.info(f"Firmware -> {base}")
-                os.makedirs(base, exist_ok=True)
-                shutil.copy(self.firmware_package.path, os.path.join(base, "firmware.tar"))
-                self.firmware_package.save_manifest(os.path.join(base, "manifest.txt"))
+                shutil.copytree(self.firmware_package.path, base)
             if part.get("copy_installer_data", False):
                 mountpoint = self.dutil.mount(info.name)
                 data_path = os.path.join(mountpoint, "asahi")
                 os.makedirs(data_path, exist_ok=True)
                 self.idata_targets.append(data_path)
+
+        if "extras" in self.template:
+            assert self.efi_part is not None
+            self.download_extras()
 
         p_progress("Preparing to finish installation...")
 
@@ -137,8 +169,6 @@ class OSInstaller(PackageInstaller):
         next_object = self.template.get("next_object", None)
         logging.info(f"  Boot object: {boot_object}")
         logging.info(f"  Next object: {next_object}")
-        with open(os.path.join("boot", boot_object), "rb") as fd:
-            m1n1_data = fd.read()
 
         m1n1_vars = []
         if self.efi_part:
@@ -151,9 +181,6 @@ class OSInstaller(PackageInstaller):
         for i in m1n1_vars:
             logging.info(f"  {i}")
 
-        m1n1_data += b"".join(i.encode("ascii") + b"\n" for i in m1n1_vars) + b"\0\0\0\0"
+        m1n1.build(os.path.join("boot", boot_object), stub_ins.boot_obj_path, m1n1_vars)
 
-        with open(boot_obj_path, "wb") as fd:
-            fd.write(m1n1_data)
-
-        logging.info(f"Built boot object at {boot_obj_path}")
+        logging.info(f"Built boot object at {stub_ins.boot_obj_path}")

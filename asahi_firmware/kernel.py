@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 import struct, os, logging
-from .img4 import img4p_extract_compressed
+from .img4 import img4p_extract
 from .core import FWFile
 from .asmedia import extract_asmedia
 
@@ -12,18 +12,21 @@ class KernelFWCollection(object):
         self.load(source_path)
 
     def load(self, source_path):
-        for fname in os.listdir(source_path):
-            if fname.startswith("kernelcache"):
-                kern_path = os.path.join(source_path, fname)
-                break
+        if os.path.isdir(source_path):
+            for fname in os.listdir(source_path):
+                if fname.startswith("kernelcache"):
+                    kern_path = os.path.join(source_path, fname)
+                    break
+            else:
+                raise Exception("Could not find kernelcache")
         else:
-            raise Exception("Could not find kernelcache")
+            kern_path = source_path
 
         log.info(f"Extracting firmware from kernel at {kern_path}")
 
         with open(kern_path, "rb") as fd:
             im4p = fd.read()
-        name, kernel = img4p_extract_compressed(im4p)
+        name, kernel = img4p_extract(im4p)
 
         for fwf in extract_asmedia(kernel):
             self.fwfiles.append((fwf.name, fwf))

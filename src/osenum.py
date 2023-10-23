@@ -2,6 +2,7 @@
 import os, os.path, plistlib, subprocess, logging
 from dataclasses import dataclass
 
+import m1n1
 from util import *
 
 UUID_SROS = "3D3287DE-280D-4619-AAAB-D97469CA9C71"
@@ -22,7 +23,9 @@ class OSInfo:
     preboot: object = None
     recovery: object = None
     rec_vgid: str = None
+    preboot_vgid: str = None
     bp: object = None
+    paired: bool = False
     admin_users: object = None
 
     def __str__(self):
@@ -65,6 +68,9 @@ class OSEnum:
 
     def collect_recovery(self, part):
         logging.info(f"OSEnum.collect_recovery(part={part.name})")
+        if part.container is None:
+            return
+
         recs = []
 
         for volume in part.container["Volumes"]:
@@ -93,6 +99,8 @@ class OSEnum:
         part.os = []
 
         ct = part.container
+        ct_name = ct.get("ContainerReference", None)
+
         by_role = {}
         by_device = {}
 
@@ -118,10 +126,23 @@ class OSEnum:
             if len(data) != 1 or len(system) != 1:
                 logging.info(f"  Weird VG: {vg['Volumes']}")
                 continue
+            data = data[0]["DeviceIdentifier"]
+            system = system[0]["DeviceIdentifier"]
 
-            volumes["Data"] = by_device[data[0]["DeviceIdentifier"]]
-            volumes["System"] = by_device[system[0]["DeviceIdentifier"]]
+            volumes["Data"] = by_device[data]
+            volumes["System"] = by_device[system]
+
             vgid = vg["APFSVolumeGroupUUID"]
+
+            if self.sysinfo.boot_uuid == vgid:
+                for volume in self.dutil.disk_parts[ct_name]["APFSVolumes"]:
+                    if "MountedSnapshots" not in volume:
+                        continue
+                    snapshots = volume["MountedSnapshots"]
+                    if volume["DeviceIdentifier"] == system and len(snapshots) == 1:
+                        volumes = dict(volumes)
+                        volumes["System"]["DeviceIdentifier"] = snapshots[0]["SnapshotBSD"]
+
             os = self.collect_os(part, volumes, vgid)
             logging.info(f" Found {os}")
             part.os.append(os)
@@ -145,6 +166,7 @@ class OSEnum:
             logging.info(f"  Failed to mount Data (FileVault?)")
 
         rec_vgid = volumes["Recovery"]["APFSVolumeUUID"]
+        preboot_vgid = volumes["Preboot"]["APFSVolumeUUID"]
 
         stub = not os.path.exists(os.path.join(mounts["System"], "Library"))
 
@@ -159,7 +181,8 @@ class OSEnum:
                      data=mounts["Data"],
                      preboot=mounts["Preboot"],
                      recovery=mounts["Recovery"],
-                     rec_vgid=rec_vgid)
+                     rec_vgid=rec_vgid,
+                     preboot_vgid=preboot_vgid)
 
         for name in ("SystemVersion.plist", "SystemVersion-disabled.plist"):
             try:
@@ -203,10 +226,13 @@ class OSEnum:
                                      osi.bp["nsih"],
                                      "System/Library/Caches/com.apple.kernelcaches",
                                      "kernelcache.custom." + coih)
-            fuos = open(fuos_path, "rb").read()
-            if b"##m1n1_ver##" in fuos:
-                osi.m1n1_ver = fuos.split(b"##m1n1_ver##")[1].split(b"\0")[0].decode("ascii")
-                logging.info(f"  m1n1 version found: {osi.m1n1_ver}")
+            if os.path.exists(fuos_path):
+                osi.m1n1_ver = m1n1.get_version(fuos_path)
+                if osi.m1n1_ver:
+                    logging.info(f"  m1n1 version found: {osi.m1n1_ver}")
+
+        if b": Paired" in bps:
+            osi.paired = True
 
         return osi
 

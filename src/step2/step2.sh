@@ -4,6 +4,7 @@
 set -e
 
 VGID="##VGID##"
+PREBOOT="##PREBOOT##"
 
 self="$0"
 cd "${self%%step2.sh}"
@@ -19,6 +20,9 @@ echo
 echo "VGID: $VGID"
 echo "System volume: $system_dir"
 echo
+
+BOLD="$(printf '\033[1m')"
+RST="$(printf '\033[m')"
 
 bputil -d -v "$VGID" >/tmp/bp.txt
 
@@ -82,6 +86,14 @@ if ! grep -q 'one true recoveryOS' /tmp/bp.txt; then
     exit 1
 fi
 
+echo "You will see some messages advising you that you are changing the"
+echo "security level of your system. These changes apply only to your"
+echo "Asahi Linux install, and are necessary to install a third-party OS."
+echo
+echo "Apple Silicon platforms maintain a separate security level for each"
+echo "installed OS, and are designed to retain their security with mixed OSes."
+echo "${BOLD}The security level of your macOS install will not be affected.${RST}"
+echo
 echo "You will be prompted for login credentials two times."
 echo "Please enter your macOS credentials (for the macOS that you"
 echo "used to run the first step of the installation)."
@@ -100,6 +112,14 @@ done
 
 echo
 echo
+
+if [ -e "/System/Volumes/iSCPreboot/$VGID/boot" ]; then
+    # This is an external volume, and kmutil has a problem with trying to pick
+    # up the AdminUserRecoveryInfo.plist from the wrong place. Work around that.
+    diskutil mount "$PREBOOT"
+    preboot="$(diskutil info "$PREBOOT" | grep "Mount Point" | sed 's, *Mount Point: *,,')"
+    cp -R "$preboot/$VGID/var" "/System/Volumes/iSCPreboot/$VGID/"
+fi
 
 while ! kmutil configure-boot -c boot.bin --raw --entry-point 2048 --lowest-virtual-address 0 -v "$system_dir"; do
     echo
